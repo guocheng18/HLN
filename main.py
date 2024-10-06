@@ -2,6 +2,7 @@ import argparse
 import datetime
 import logging
 import sys
+import time
 from collections import defaultdict
 
 import torch
@@ -9,6 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
+from torchinfo import summary
+from tqdm import tqdm
 
 import hln
 from datasets.api import Lastfm, Yoochoose, batch_padding
@@ -28,13 +31,18 @@ def evaluate(model, dataloader, klist, rlist):
     recalls, mrrs = defaultdict(int), defaultdict(int)
     gates, gates_count = defaultdict(int), defaultdict(int)
 
-    with torch.no_grad():
+    total_batch_time = 0
 
+    with torch.no_grad():
         for seqs, mask, labs in dataloader:
             batch_size = seqs.size(0)
             lens = mask.sum(1)
             seqs, labs = seqs.cuda(), labs.cuda()
+
+            batch_start_time = time.time()
             labs_p, gate = model(seqs)
+            batch_end_time = time.time()
+            total_batch_time += batch_end_time - batch_start_time
 
             for r in rlist:
                 gates_ = gate[lens == r]
@@ -42,7 +50,8 @@ def evaluate(model, dataloader, klist, rlist):
                     gates[r] += gates_.sum(0)[:, :r]
                     gates_count[r] += gates_.size(0)
 
-            ranks = (labs_p > labs_p[range(batch_size), labs].unsqueeze(1)).sum(1) + 1
+            ranks = (labs_p > labs_p[range(batch_size),
+                     labs].unsqueeze(1)).sum(1) + 1
             for k in klist:
                 ranks_in = ranks <= k
                 recalls[k] += ranks_in.sum().item()
@@ -51,11 +60,15 @@ def evaluate(model, dataloader, klist, rlist):
         for r in rlist:
             if gates_count[r]:
                 gates[r] = gates[r].cpu() / gates_count[r]
-            logger.info("Sessions of length %d in test data: %d", r, gates_count[r])
+            logger.info("Sessions of length %d in test data: %d",
+                        r, gates_count[r])
 
         for k in klist:
             recalls[k] /= len(dataloader.dataset)
             mrrs[k] /= len(dataloader.dataset)
+
+    logger.info(f"Avg. time per batch: {
+                total_batch_time/len(dataloader):.6f} seconds")
 
     return recalls, mrrs, gates
 
@@ -112,12 +125,14 @@ if __name__ == "__main__":
         length = len(data)
         valid_length = int(round(length * args.valid_portion))
         train_length = length - valid_length
-        train_data, test_data = random_split(data, [train_length, valid_length])
+        train_data, test_data = random_split(
+            data, [train_length, valid_length])
         logger.info("Using validation dataset as test dataset")
     else:
         train_data = DATASET(train_data_path, args.truncate_steps)
         test_data = DATASET(test_data_path, args.truncate_steps)
-    logger.info("Traning data: %d, test data: %d", len(train_data), len(test_data))
+    logger.info("Traning data: %d, test data: %d",
+                len(train_data), len(test_data))
 
     # DataLoader
     trainloader = DataLoader(train_data,
@@ -133,20 +148,26 @@ if __name__ == "__main__":
                             num_workers=args.num_workers,
                             pin_memory=True)
 
-    model = hln.HLN(total_items, args.embed_dim, args.hidden_dim, args.num_prefers)
+    model = hln.HLN(total_items, args.embed_dim,
+                    args.hidden_dim, args.num_prefers)
     model.cuda()
 
     if args.optimizer == "adam":
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
     else:
-        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+        optimizer = optim.SGD(model.parameters(),
+                              lr=args.lr, momentum=args.momentum)
 
-    lr_scheduler = optim.lr_scheduler.StepLR(optimizer, args.lr_dc_step, gamma=args.lr_dc)
+    lr_scheduler = optim.lr_scheduler.StepLR(
+        optimizer, args.lr_dc_step, gamma=args.lr_dc)
 
     batch_idx = 0
     for epoch in range(args.max_epochs):
         model.train()
-        for i, (seqs, mask, labs) in enumerate(trainloader, batch_idx):
+
+        epoch_start_time = time.time()
+
+        for i, (seqs, mask, labs) in enumerate(tqdm(trainloader), batch_idx):
             seqs, labs = seqs.cuda(), labs.cuda()
             optimizer.zero_grad()
 
@@ -159,10 +180,21 @@ if __name__ == "__main__":
 
         batch_idx += len(trainloader)
 
+        epoch_end_time = time.time()
+        logger.info(f"Total epoch time: {
+                    epoch_end_time - epoch_start_time:.4f} seconds")
+
+        torch.save(model.state_dict(), f"hln_checkpoint_epoch{epoch}.pt")
+
         # Evaluate
         model.eval()
         recalls, mrrs, gates = evaluate(model, testloader, klist, rlist)
         for k in klist:
-            logger.info("Epoch %d: recall@%d %f, mrr@%d %f", epoch, k, recalls[k], k, mrrs[k])
+            logger.info("Epoch %d: recall@%d %f, mrr@%d %f",
+                        epoch, k, recalls[k], k, mrrs[k])
 
         lr_scheduler.step()
+
+    # Print model summary
+    summary(model, input_size=(args.train_batch_size,
+            args.truncate_steps), dtypes=[torch.long], device='cuda')
